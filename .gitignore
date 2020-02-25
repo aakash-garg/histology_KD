@@ -1,0 +1,6 @@
+checkpoints/*
+dataset/*
+dataset_norm/*
+
+!dataset/.gitkeep
+!checkpoints/.gitkeep
