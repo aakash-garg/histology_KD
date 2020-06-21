@@ -11,13 +11,14 @@ from torch.autograd import Variable
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import roc_curve, auc
 from sklearn.preprocessing import label_binarize
+import logging
 
 from .datasets import *
 
 class BaseModel:
     def __init__(self, args, network, weights_path):
         self.args = args
-        self.weights = os.path.join(weights_path, 'weights_' + args.resnet + "_" + str(args.seed) + "_" + str(args.run))
+        self.weights = os.path.join(weights_path, 'weights_' + args.student + "_" + str(args.seed) + "_" + str(args.run))
         if not os.path.exists(self.weights):
             os.makedirs(self.weights)
         self.network = network.cuda() if args.cuda else network
@@ -48,6 +49,18 @@ class PatchWiseModel(BaseModel):
         super(PatchWiseModel, self).__init__(args, network, args.checkpoints_path)
 
     def train(self):
+        filename = os.path.join(self.weights, 'train.log')
+        logger_name = "TrainingLog"
+        self.logger = logging.getLogger(logger_name)
+        self.logger.setLevel(logging.INFO)
+        fh = logging.FileHandler(filename, mode='a')
+        fh.setLevel(logging.INFO)
+        self.logger.addHandler(fh)
+        console = logging.StreamHandler()
+        console.setLevel(logging.INFO)
+        self.logger.addHandler(console)
+
+        self.logger.info('Training! ...')
         if self.args.load_chkpt:
             self.load()
         self.network.train()
@@ -57,22 +70,27 @@ class PatchWiseModel(BaseModel):
             dataset=PatchWiseDataset(path=self.args.dataset_path, phase='train', stride=self.args.patch_stride, rotate=False, flip=False, enhance=False, seed=self.args.seed),
             batch_size=self.args.batch_size,
             shuffle=True,
-            num_workers=4
+            num_workers=0
         )
 
         optimizer = optim.Adam(self.network.parameters(), lr=self.args.lr, betas=(self.args.beta1, self.args.beta2))
         scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.1)
-        best = self.validate(verbose=False)
+        best = self.validate(self.logger, verbose=False)
         loss_fnc = nn.CrossEntropyLoss()
         mean = 0
         epoch = 0
         best_epoch = 0
         for epoch in range(1, self.args.epochs + 1):
+            self.logger.info('-' * 10)
+
             self.network.train()
             stime = datetime.datetime.now()
 
             correct = 0
             total = 0
+            running_loss = 0
+            running_correct = 0
+            running_total = 0
 
             for index, (images, labels) in enumerate(train_loader):
 
@@ -86,6 +104,305 @@ class PatchWiseModel(BaseModel):
                 optimizer.step()
 
                 _, predicted = torch.max(output.data, 1)
+                correct += torch.sum(predicted == labels)
+                total += len(images)
+                running_loss += loss
+                running_correct += correct
+                running_total += total
+
+                if index > 0 and index % self.args.log_interval == 0:
+                    print('Epoch: {}/{} [{}/{} ({:.0f}%)]\tLoss: {:.6f}, Accuracy: {:.2f}%'.format(
+                        epoch,
+                        self.args.epochs,
+                        index * len(images),
+                        len(train_loader.dataset),
+                        100. * index / len(train_loader),
+                        loss.item(),
+                        100 * correct / total
+                    ))
+            self.logger.info('Epoch: {}/{} \tLoss: {:.6f}, Accuracy: {:.2f}%'.format(epoch, self.args.epochs, running_loss/index, 100 * running_correct / running_total))
+            print('\nEnd of epoch {}, time: {}'.format(epoch, datetime.datetime.now() - stime))
+            scheduler.step()
+            acc = self.validate(self.logger)
+            mean += acc
+            if acc > best:
+                best = acc
+                best_epoch = epoch
+                self.logger.info("\n###### BEST VALIDATION REPORTED! #######")
+                self.save(best=True)
+            self.logger.info('\n')
+            self.save()
+
+        logger.info('\nEnd of training, best accuracy: {}, mean accuracy: {} at epoch: {}\n'.format(best, mean // epoch, best_epoch))
+
+    def validate(self, logger, verbose=True):
+        print("\nValidating...")
+        with torch.no_grad():
+            self.network.eval()
+
+            test_loss = 0
+            correct = 0
+            classes = len(LABELS)
+            loss_fnc = nn.CrossEntropyLoss(size_average=False)
+
+            tp = [0] * classes
+            tpfp = [0] * classes
+            tpfn = [0] * classes
+            precision = [0] * classes
+            recall = [0] * classes
+            f1 = [0] * classes
+
+            val_loader = DataLoader(
+                dataset=PatchWiseDataset(path=self.args.dataset_path, phase='val', stride=self.args.patch_stride, rotate=False, flip=False, enhance=False, seed=self.args.seed),
+                batch_size=self.args.batch_size,
+                shuffle=True,
+                num_workers=0
+            )
+
+            for images, labels in val_loader:
+
+                if self.args.cuda:
+                    images, labels = images.cuda(), labels.cuda()
+
+                output = self.network(Variable(images))
+
+                # test_loss += F.nll_loss(output, Variable(labels), size_average=False).data
+                test_loss += loss_fnc(output, Variable(labels))
+                _, predicted = torch.max(output.data, 1)
+                correct += torch.sum(predicted == labels)
+
+                for label in range(classes):
+                    t_labels = labels == label
+                    p_labels = predicted == label
+                    tp[label] += torch.sum(t_labels == (p_labels * 2 - 1))
+                    tpfp[label] += torch.sum(p_labels)
+                    tpfn[label] += torch.sum(t_labels)
+
+            for label in range(classes):
+                precision[label] += (tp[label] / (tpfp[label] + 1e-8))
+                recall[label] += (tp[label] / (tpfn[label] + 1e-8))
+                f1[label] = 2 * precision[label] * recall[label] / (precision[label] + recall[label] + 1e-8)
+
+            test_loss /= len(val_loader.dataset)
+            acc = 100. * correct / len(val_loader.dataset)
+
+            if verbose:
+                # print('Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)'.format(
+                #     test_loss,
+                #     correct,
+                #     len(val_loader.dataset),
+                #     100. * correct / len(val_loader.dataset)
+                # ))
+                logger.info('Average loss: {:.4f}, Accuracy: {}/{} ({:.3f}%)'.format(
+                    test_loss,
+                    correct,
+                    len(val_loader.dataset),
+                    100. * correct / len(val_loader.dataset)
+                ))
+
+                for label in range(classes):
+                    # print('{}:  \t Precision: {:.2f},  Recall: {:.2f},  F1: {:.2f}'.format(
+                    #     LABELS[label],
+                    #     precision[label],
+                    #     recall[label],
+                    #     f1[label]
+                    # ))
+                    logger.info('{}:  \t Precision: {:.2f},  Recall: {:.2f},  F1: {:.2f}'.format(
+                        LABELS[label],
+                        precision[label],
+                        recall[label],
+                        f1[label]
+                    ))
+                logger.info('\n')
+                print('')
+            return acc
+
+    def test(self, verbose=True):
+        print("\nTesting!!!!")
+        self.load(best=True)
+        with torch.no_grad():
+            self.network.eval()
+
+            test_loss = 0
+            correct = 0
+            classes = len(LABELS)
+
+            tp = [0] * classes
+            tpfp = [0] * classes
+            tpfn = [0] * classes
+            precision = [0] * classes
+            recall = [0] * classes
+            f1 = [0] * classes
+
+            loss_fnc = nn.CrossEntropyLoss(size_average=False)
+            dataset = PatchWiseDataset(path=self.args.dataset_path, phase='test', stride=self.args.patch_stride, rotate=False, flip=False, enhance=False, seed=self.args.seed)
+            data_loader = DataLoader(dataset=dataset, batch_size=1, shuffle=False)
+            stime = datetime.datetime.now()
+
+            for images, labels in data_loader:
+
+                if self.args.cuda:
+                    images, labels = images.cuda(), labels.cuda()
+
+                output, _ = self.network(Variable(images))
+
+                test_loss += loss_fnc(output, Variable(labels))
+                _, predicted = torch.max(output.data, 1)
+                correct += torch.sum(predicted == labels)
+
+                for label in range(classes):
+                    t_labels = labels == label
+                    p_labels = predicted == label
+                    tp[label] += torch.sum(t_labels == (p_labels * 2 - 1))
+                    tpfp[label] += torch.sum(p_labels)
+                    tpfn[label] += torch.sum(t_labels)
+
+            for label in range(classes):
+                precision[label] += (tp[label] / (tpfp[label] + 1e-8))
+                recall[label] += (tp[label] / (tpfn[label] + 1e-8))
+                f1[label] = 2 * precision[label] * recall[label] / (precision[label] + recall[label] + 1e-8)
+
+            test_loss /= len(data_loader.dataset)
+            acc = 100. * correct / len(data_loader.dataset)
+
+            if verbose:
+                print('Average loss: {:.4f}, Accuracy: {}/{} ({:.2f}%)'.format(
+                    test_loss,
+                    correct,
+                    len(data_loader.dataset),
+                    100. * correct / len(data_loader.dataset)
+                ))
+
+                for label in range(classes):
+                    print('{}:  \t Precision: {:.2f},  Recall: {:.2f},  F1: {:.2f}'.format(
+                        LABELS[label],
+                        precision[label],
+                        recall[label],
+                        f1[label]
+                    ))
+
+                print('')
+            return acc
+
+
+class DistillationBaseModel:
+    def __init__(self, args, student_network, teacher_network, weights_path):
+        self.args = args
+        self.student_weights = os.path.join(weights_path, 'weights_' + args.student + "_" + str(args.seed) + "_" + str(args.run))
+        self.teacher_weights = os.path.join(weights_path, args.teacher_path)
+        if not os.path.exists(self.student_weights):
+            os.makedirs(self.student_weights)
+        self.student_network = student_network.cuda() if args.cuda else student_network
+        self.teacher_network = teacher_network.cuda() if args.cuda else teacher_network
+        self.load()
+
+    def load(self, best=False, teacher=True):
+        if teacher == True:
+            try:
+                if os.path.exists(os.path.exists(os.path.join(self.teacher_weights, 'best.pth'))):
+                    print('Loading teacher model checkpoint...')
+                    self.teacher_network.load_state_dict(torch.load(os.path.join(self.teacher_weights, 'best.pth')))
+            except:
+                print('Failed to load the teacher network checkpoint !!!')
+
+        try:
+            if os.path.exists(os.path.join(self.student_weights, 'current.pth')) or os.path.exists(os.path.join(self.student_weights, 'best.pth')):
+                print('Loading student model checkpoint...')
+                if best:
+                    self.student_network.load_state_dict(torch.load(os.path.join(self.student_weights, 'best.pth')))
+                else:
+                    self.student_network.load_state_dict(torch.load(os.path.join(self.student_weights, 'current.pth')))
+        except:
+            print('Failed to load checkpoint !!!')
+
+    def save(self, best=False):
+        if best:
+            print('Saving best model to "{}"'.format(self.student_weights))
+            torch.save(self.student_network.state_dict(), os.path.join(self.student_weights, 'best.pth'))
+        else:
+            print('Saving current model to "{}"'.format(self.student_weights))
+            torch.save(self.student_network.state_dict(), os.path.join(self.student_weights, 'current.pth'))
+
+
+class DistillationModel(DistillationBaseModel):
+    def __init__(self, args, student_network, teacher_network):
+        super(DistillationModel, self).__init__(args, student_network, teacher_network, args.checkpoints_path)
+
+    def KD_loss_fn(self, outputs, labels, teacher_outputs):
+        alpha = 0.9
+        T = 20.0
+        KD_loss = nn.KLDivLoss()(F.log_softmax(outputs/T, dim=1), \
+                                    F.softmax(teacher_outputs/T, dim=1)) * (alpha * T * T)+ \
+                                    F.cross_entropy(outputs, labels) * (1. - alpha)
+        return KD_loss
+
+    def MSE_loss_fn(self, outputs, labels):
+        return torch.nn.MSELoss()(outputs,labels)
+
+    def get_attention(self, fm, eps=1e-5):
+        am = torch.pow(torch.abs(fm), 2)
+        am = torch.sum(am, dim=1, keepdim=True)
+        norm = torch.norm(am, dim=(2,3), keepdim=True)
+        am = torch.div(am, norm+eps)
+
+        return am
+
+    def train_kd(self):
+        filename = os.path.join(self.student_weights, 'train.log')
+        logger_name = "TrainingLog"
+        self.logger = logging.getLogger(logger_name)
+        self.logger.setLevel(logging.INFO)
+        fh = logging.FileHandler(filename, mode='a')
+        fh.setLevel(logging.INFO)
+        self.logger.addHandler(fh)
+        console = logging.StreamHandler()
+        console.setLevel(logging.INFO)
+        self.logger.addHandler(console)
+
+        self.logger.info('Training using Knowledge Distillation! ...')
+
+        if self.args.load_chkpt:
+            self.load(teacher=False)
+        self.student_network.train()
+        self.teacher_network.eval()
+
+        print('Start training the Knowledge Distillation network: {}\n'.format(time.strftime('%Y/%m/%d %H:%M')))
+
+        train_loader = DataLoader(
+            dataset=PatchWiseDataset(path=self.args.dataset_path, phase='train', stride=self.args.patch_stride, rotate=False, flip=False, enhance=False, seed=self.args.seed),
+            batch_size=self.args.batch_size,
+            shuffle=True,
+            num_workers=4
+        )
+
+        optimizer = optim.Adam(self.student_network.parameters(), lr=self.args.lr, betas=(self.args.beta1, self.args.beta2))
+        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.1)
+        # best = self.validate(verbose=False)
+        best = 0
+        loss_fnc = nn.CrossEntropyLoss()
+        mean = 0
+        epoch = 0
+        best_epoch = 0
+        for epoch in range(1, self.args.epochs + 1):
+            self.student_network.train()
+            stime = datetime.datetime.now()
+
+            correct = 0
+            total = 0
+
+            for index, (images, labels) in enumerate(train_loader):
+
+                if self.args.cuda:
+                    images, labels = images.cuda(), labels.cuda()
+
+                optimizer.zero_grad()
+                student_output, _ = self.student_network(Variable(images))
+                teacher_output, _ = self.teacher_network(Variable(images))
+                loss = self.KD_loss_fn(student_output, Variable(labels), teacher_output)
+                loss.backward()
+                optimizer.step()
+
+                _, predicted = torch.max(student_output.data, 1)
                 correct += torch.sum(predicted == labels)
                 total += len(images)
 
@@ -113,139 +430,234 @@ class PatchWiseModel(BaseModel):
 
         print('\nEnd of training, best accuracy: {}, mean accuracy: {} at epoch: {}\n'.format(best, mean // epoch, best_epoch))
 
-    def validate(self, verbose=True):
-        print("\nValidating...")
-        self.network.eval()
+    def train_at(self):
+        filename = os.path.join(self.student_weights, 'train.log')
+        logger_name = "TrainingLog"
+        self.logger = logging.getLogger(logger_name)
+        self.logger.setLevel(logging.INFO)
+        fh = logging.FileHandler(filename, mode='a')
+        fh.setLevel(logging.INFO)
+        self.logger.addHandler(fh)
+        console = logging.StreamHandler()
+        console.setLevel(logging.INFO)
+        self.logger.addHandler(console)
 
-        test_loss = 0
-        correct = 0
-        classes = len(LABELS)
-        loss_fnc = nn.CrossEntropyLoss(size_average=False)
+        self.logger.info('Training using Attention Transfer! ...')
 
-        tp = [0] * classes
-        tpfp = [0] * classes
-        tpfn = [0] * classes
-        precision = [0] * classes
-        recall = [0] * classes
-        f1 = [0] * classes
+        if self.args.load_chkpt:
+            self.load(teacher=False)
+        self.student_network.train()
+        self.teacher_network.eval()
 
-        val_loader = DataLoader(
-            dataset=PatchWiseDataset(path=self.args.dataset_path, phase='val', stride=self.args.patch_stride, rotate=False, flip=False, enhance=False, seed=self.args.seed),
+        print('Start training the Attention Transfer network: {}\n'.format(time.strftime('%Y/%m/%d %H:%M')))
+
+        train_loader = DataLoader(
+            dataset=PatchWiseDataset(path=self.args.dataset_path, phase='train', stride=self.args.patch_stride, rotate=False, flip=False, enhance=False, seed=self.args.seed),
             batch_size=self.args.batch_size,
             shuffle=True,
             num_workers=4
         )
 
-        for images, labels in val_loader:
+        optimizer = optim.Adam(self.student_network.parameters(), lr=self.args.lr, betas=(self.args.beta1, self.args.beta2))
+        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.1)
+        # best = self.validate(verbose=False)
+        best = 0
+        loss_fnc = nn.CrossEntropyLoss()
+        mean = 0
+        epoch = 0
+        best_epoch = 0
+        for epoch in range(1, self.args.epochs + 1):
+            self.student_network.train()
+            stime = datetime.datetime.now()
 
-            if self.args.cuda:
-                images, labels = images.cuda(), labels.cuda()
+            correct = 0
+            total = 0
 
-            output = self.network(Variable(images))
+            for index, (images, labels) in enumerate(train_loader):
 
-            # test_loss += F.nll_loss(output, Variable(labels), size_average=False).data
-            test_loss = loss_fnc(output, Variable(labels))
-            _, predicted = torch.max(output.data, 1)
-            correct += torch.sum(predicted == labels)
+                if self.args.cuda:
+                    images, labels = images.cuda(), labels.cuda()
+
+                optimizer.zero_grad()
+                student_output, student_fmaps = self.student_network(Variable(images))
+                teacher_output, teacher_fmaps = self.teacher_network(Variable(images))
+                student_fmaps = list(map(self.get_attention, student_fmaps))
+                teacher_fmaps = list(map(self.get_attention, teacher_fmaps))
+                if(len(student_fmaps) < len(teacher_fmaps)):
+                    teacher_fmaps = teacher_fmaps[:-1]
+                loss = self.KD_loss_fn(student_output, Variable(labels), teacher_output)
+                for i in range(len(student_fmaps)):
+                    loss += self.MSE_loss_fn(student_fmaps[i], teacher_fmaps[i])
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                _, predicted = torch.max(student_output.data, 1)
+                correct += torch.sum(predicted == labels)
+                total += len(images)
+
+                if index > 0 and index % self.args.log_interval == 0:
+                    print('Epoch: {}/{} [{}/{} ({:.0f}%)]\tLoss: {:.6f}, Accuracy: {:.2f}%'.format(
+                        epoch,
+                        self.args.epochs,
+                        index * len(images),
+                        len(train_loader.dataset),
+                        100. * index / len(train_loader),
+                        loss.item(),
+                        100 * correct / total
+                    ))
+
+            print('\nEnd of epoch {}, time: {}'.format(epoch, datetime.datetime.now() - stime))
+            scheduler.step()
+            acc = self.validate()
+            mean += acc
+            if acc > best:
+                best = acc
+                best_epoch = epoch
+                print("\n###### BEST VALIDATION REPORTED! #######")
+                self.save(best=True)
+            self.save()
+
+        print('\nEnd of training, best accuracy: {}, mean accuracy: {} at epoch: {}\n'.format(best, mean // epoch, best_epoch))
+
+
+    def validate(self, verbose=True):
+        with torch.no_grad():
+            print("\nValidating...")
+            self.student_network.eval()
+
+            test_loss = 0
+            correct = 0
+            classes = len(LABELS)
+            loss_fnc = nn.CrossEntropyLoss(size_average=False)
+
+            tp = [0] * classes
+            tpfp = [0] * classes
+            tpfn = [0] * classes
+            precision = [0] * classes
+            recall = [0] * classes
+            f1 = [0] * classes
+
+            val_loader = DataLoader(
+                dataset=PatchWiseDataset(path=self.args.dataset_path, phase='val', stride=self.args.patch_stride, rotate=False, flip=False, enhance=False, seed=self.args.seed),
+                batch_size=self.args.batch_size,
+                shuffle=True,
+                num_workers=4
+            )
+
+            for images, labels in val_loader:
+
+                if self.args.cuda:
+                    images, labels = images.cuda(), labels.cuda()
+
+                output, _ = self.student_network(Variable(images))
+
+                # test_loss += F.nll_loss(output, Variable(labels), size_average=False).data
+                test_loss += loss_fnc(output, Variable(labels))
+                _, predicted = torch.max(output.data, 1)
+                correct += torch.sum(predicted == labels)
+
+                for label in range(classes):
+                    t_labels = labels == label
+                    p_labels = predicted == label
+                    tp[label] += torch.sum(t_labels == (p_labels * 2 - 1))
+                    tpfp[label] += torch.sum(p_labels)
+                    tpfn[label] += torch.sum(t_labels)
 
             for label in range(classes):
-                t_labels = labels == label
-                p_labels = predicted == label
-                tp[label] += torch.sum(t_labels == (p_labels * 2 - 1))
-                tpfp[label] += torch.sum(p_labels)
-                tpfn[label] += torch.sum(t_labels)
+                precision[label] += (tp[label] / (tpfp[label] + 1e-8))
+                recall[label] += (tp[label] / (tpfn[label] + 1e-8))
+                f1[label] = 2 * precision[label] * recall[label] / (precision[label] + recall[label] + 1e-8)
 
-        for label in range(classes):
-            precision[label] += (tp[label] / (tpfp[label] + 1e-8))
-            recall[label] += (tp[label] / (tpfn[label] + 1e-8))
-            f1[label] = 2 * precision[label] * recall[label] / (precision[label] + recall[label] + 1e-8)
+            test_loss /= len(val_loader.dataset)
+            acc = 100. * correct / len(val_loader.dataset)
 
-        test_loss /= len(val_loader.dataset)
-        acc = 100. * correct / len(val_loader.dataset)
-
-        if verbose:
-            print('Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)'.format(
-                test_loss,
-                correct,
-                len(val_loader.dataset),
-                100. * correct / len(val_loader.dataset)
-            ))
-
-            for label in range(classes):
-                print('{}:  \t Precision: {:.2f},  Recall: {:.2f},  F1: {:.2f}'.format(
-                    LABELS[label],
-                    precision[label],
-                    recall[label],
-                    f1[label]
+            if verbose:
+                print('Average loss: {:.4f}, Accuracy: {}/{} ({:.2f}%)'.format(
+                    test_loss,
+                    correct,
+                    len(val_loader.dataset),
+                    100. * correct / len(val_loader.dataset)
                 ))
 
-            print('')
-        return acc
+                for label in range(classes):
+                    print('{}:  \t Precision: {:.2f},  Recall: {:.2f},  F1: {:.2f}'.format(
+                        LABELS[label],
+                        precision[label],
+                        recall[label],
+                        f1[label]
+                    ))
+
+                print('')
+            return acc
 
     def test(self, verbose=True):
         print("\nTesting!!!!")
         self.load(best=True)
-        self.network.eval()
+        with torch.no_grad():
+            self.student_network.eval()
 
-        test_loss = 0
-        correct = 0
-        classes = len(LABELS)
+            test_loss = 0
+            correct = 0
+            classes = len(LABELS)
 
-        tp = [0] * classes
-        tpfp = [0] * classes
-        tpfn = [0] * classes
-        precision = [0] * classes
-        recall = [0] * classes
-        f1 = [0] * classes
+            tp = [0] * classes
+            tpfp = [0] * classes
+            tpfn = [0] * classes
+            precision = [0] * classes
+            recall = [0] * classes
+            f1 = [0] * classes
 
-        dataset = PatchWiseDataset(path=self.args.dataset_path, phase='test', stride=self.args.patch_stride, rotate=False, flip=False, enhance=False, seed=self.args.seed)
-        data_loader = DataLoader(dataset=dataset, batch_size=1, shuffle=False)
-        stime = datetime.datetime.now()
+            loss_fnc = nn.CrossEntropyLoss(size_average=False)
+            dataset = PatchWiseDataset(path=self.args.dataset_path, phase='test', stride=self.args.patch_stride, rotate=False, flip=False, enhance=False, seed=self.args.seed)
+            data_loader = DataLoader(dataset=dataset, batch_size=1, shuffle=False)
+            stime = datetime.datetime.now()
 
-        for images, labels in data_loader:
+            for images, labels in data_loader:
 
-            if self.args.cuda:
-                images, labels = images.cuda(), labels.cuda()
+                if self.args.cuda:
+                    images, labels = images.cuda(), labels.cuda()
 
-            output = self.network(Variable(images))
+                output, _ = self.student_network(Variable(images))
 
-            test_loss += F.nll_loss(output, Variable(labels), size_average=False).data
-            _, predicted = torch.max(output.data, 1)
-            correct += torch.sum(predicted == labels)
+                test_loss += loss_fnc(output, Variable(labels))
+                _, predicted = torch.max(output.data, 1)
+                correct += torch.sum(predicted == labels)
 
-            for label in range(classes):
-                t_labels = labels == label
-                p_labels = predicted == label
-                tp[label] += torch.sum(t_labels == (p_labels * 2 - 1))
-                tpfp[label] += torch.sum(p_labels)
-                tpfn[label] += torch.sum(t_labels)
-
-        for label in range(classes):
-            precision[label] += (tp[label] / (tpfp[label] + 1e-8))
-            recall[label] += (tp[label] / (tpfn[label] + 1e-8))
-            f1[label] = 2 * precision[label] * recall[label] / (precision[label] + recall[label] + 1e-8)
-
-        test_loss /= len(data_loader.dataset)
-        acc = 100. * correct / len(data_loader.dataset)
-
-        if verbose:
-            print('Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)'.format(
-                test_loss,
-                correct,
-                len(data_loader.dataset),
-                100. * correct / len(data_loader.dataset)
-            ))
+                for label in range(classes):
+                    t_labels = labels == label
+                    p_labels = predicted == label
+                    tp[label] += torch.sum(t_labels == (p_labels * 2 - 1))
+                    tpfp[label] += torch.sum(p_labels)
+                    tpfn[label] += torch.sum(t_labels)
 
             for label in range(classes):
-                print('{}:  \t Precision: {:.2f},  Recall: {:.2f},  F1: {:.2f}'.format(
-                    LABELS[label],
-                    precision[label],
-                    recall[label],
-                    f1[label]
+                precision[label] += (tp[label] / (tpfp[label] + 1e-8))
+                recall[label] += (tp[label] / (tpfn[label] + 1e-8))
+                f1[label] = 2 * precision[label] * recall[label] / (precision[label] + recall[label] + 1e-8)
+
+            test_loss /= len(data_loader.dataset)
+            acc = 100. * correct / len(data_loader.dataset)
+
+            if verbose:
+                print('Average loss: {:.4f}, Accuracy: {}/{} ({:.2f}%)'.format(
+                    test_loss,
+                    correct,
+                    len(data_loader.dataset),
+                    100. * correct / len(data_loader.dataset)
                 ))
 
-            print('')
-        return acc
+                for label in range(classes):
+                    print('{}:  \t Precision: {:.2f},  Recall: {:.2f},  F1: {:.2f}'.format(
+                        LABELS[label],
+                        precision[label],
+                        recall[label],
+                        f1[label]
+                    ))
+
+                print('')
+            return acc
 
     # def test(self, verbose=True):
     #     self.network.eval()

@@ -16,9 +16,14 @@ model_dict = {
 }
 
 
-def create_model(args):
-    model_cls = model_dict[args.resnet]
-    print(f"Building model {args.resnet}...", end='')
+def create_model(args, student=True):
+    if student:
+        model_cls = model_dict[args.student]
+        print(f"Building model {args.student}...", end='')
+    else:
+        model_cls = model_dict[args.teacher]
+        print(f"Using model {args.teacher}...", end='')
+
     model = model_cls(num_classes=args.num_classes, pretrained=args.pretrained)
     total_params = sum(p.numel() for p in model.parameters())
     layers = len(list(model.modules()))

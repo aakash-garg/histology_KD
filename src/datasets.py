@@ -12,8 +12,10 @@ LABELS = ['Normal', 'Benign', 'InSitu', 'Invasive']
 IMAGE_SIZE = (2048, 1536)
 PATCH_SIZE = 512
 train_ratio = 0.7
-val_ratio = 0.1
-test_ratio = 0.2
+val_ratio = 0.15
+test_ratio = 0.15
+# train_ratio = 0.8
+# val_ratio = 0.2
 
 class PatchWiseDataset(Dataset):
     def __init__(self, path, phase, stride=PATCH_SIZE, rotate=False, flip=False, enhance=False, seed = 1):

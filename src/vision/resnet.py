@@ -195,18 +195,18 @@ class ResNet(nn.Module):
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
-        x = self.maxpool(x)
+        x0 = self.maxpool(x)
 
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
+        x1 = self.layer1(x0)
+        x2 = self.layer2(x1)
+        x3 = self.layer3(x2)
+        x4 = self.layer4(x3)
 
-        x = self.avgpool(x)
+        x = self.avgpool(x4)
         x = torch.flatten(x, 1)
         x = self.fc(x)
 
-        return x
+        return x, [x1, x2, x3, x4]
 
     def forward(self, x):
         return self._forward_impl(x)
@@ -293,17 +293,17 @@ class ResNetSmall(nn.Module):
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
-        x = self.maxpool(x)
+        x0 = self.maxpool(x)
 
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
+        x1 = self.layer1(x0)
+        x2 = self.layer2(x1)
+        x3 = self.layer3(x2)
 
-        x = self.avgpool(x)
+        x = self.avgpool(x3)
         x = torch.flatten(x, 1)
         x = self.fc(x)
 
-        return x
+        return x, [x1, x2, x3]
 
     def forward(self, x):
         return self._forward_impl(x)
